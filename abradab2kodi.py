@@ -38,16 +38,19 @@ from xml.etree import ElementTree as ET
 # Znane stacje Polskiego Radia DAB+ (SID → nazwa)
 # Uzupełnij lub rozszerz o swoje stacje
 # ──────────────────────────────────────────────
+# KNOWN_STATIONS jest teraz tylko ostatecznym fallbackiem.
+# Prawdziwe nazwy są czytane z ServiceList.json (AbracaDABra) lub /mux.json (welle-cli).
+# Możesz dodać tu wpisy dla stacji spoza AbracaDABra lub zdefiniować logo.
 KNOWN_STATIONS = {
-    "3211": {"name": "PR1 Jedynka",      "logo": "pr1.png",    "group": "Polskie Radio"},
-    "3222": {"name": "PR2 Dwójka",       "logo": "pr2.png",    "group": "Polskie Radio"},
-    "3233": {"name": "PR3 Trójka",       "logo": "pr3.png",    "group": "Polskie Radio"},
-    "32a3": {"name": "PR2 Chopin",       "logo": "cho.png",    "group": "Polskie Radio"},
-    "32a4": {"name": "PR Rytm",          "logo": "pr_rytm.png","group": "Polskie Radio"},
-    "32a5": {"name": "Radio Poland",     "logo": "r94i4.png",  "group": "Polskie Radio"},
-    "32a6": {"name": "PR4 Czwórka",      "logo": "pr4.png",    "group": "Polskie Radio"},
-    # Dodaj więcej stacji tutaj (SID w hex bez 0x)
+    # "SID_hex": {"name": "Nazwa", "logo": "plik.png", "group": "Grupa"},
 }
+
+# Domyślna lokalizacja ServiceList.json (Qt config AbracaDABra)
+_SERVICE_LIST_PATHS = [
+    Path.home() / ".config/AbracaDABra/ServiceList.json",
+    Path.home() / "AppData/Roaming/AbracaDABra/ServiceList.json",   # Windows
+    Path.home() / "Library/Preferences/AbracaDABra/ServiceList.json",  # macOS
+]
 
 
 def parse_duration(iso_dur: str) -> int:
@@ -216,6 +219,66 @@ def load_all_programmes(epg_dir: Path) -> dict:
     return by_sid
 
 
+
+def read_service_list(service_list_path: str = "") -> dict:
+    """
+    Czyta ServiceList.json z AbracaDABra — zawiera WSZYSTKIE stacje
+    odebrane kiedykolwiek przez aplikację, z prawdziwymi nazwami.
+
+    Format: lista obiektów z polami:
+      SID        (int, dziesiętnie, np. 14823953 = 0xE23211)
+      Label      (str, pełna nazwa, np. "PR Jedynka")
+      ShortLabel (str)
+      Ensembles  (lista z Label = nazwa multipleksu)
+
+    Zwraca: {sid_hex: {"name": str, "group": str}}
+    """
+    import json as _json
+
+    # Szukaj pliku — najpierw podana ścieżka, potem domyślne lokalizacje
+    candidates = []
+    if service_list_path:
+        candidates.append(Path(service_list_path))
+    candidates.extend(_SERVICE_LIST_PATHS)
+
+    path = None
+    for c in candidates:
+        if c.exists():
+            path = c
+            break
+
+    if not path:
+        return {}
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+    except Exception as e:
+        print(f"  [WARN] Błąd czytania {path}: {e}", file=sys.stderr)
+        return {}
+
+    stations = {}
+    for entry in data:
+        sid_dec = entry.get("SID")
+        label   = (entry.get("Label") or entry.get("ShortLabel") or "").strip()
+        if not sid_dec or not label:
+            continue
+
+        # Konwertuj SID dziesiętny → hex (tylko ostatnie 4 cyfry hex)
+        sid_hex = format(int(sid_dec), "x").lower()
+        # AbracaDABra podaje pełny SID np. e23211 — bierzemy ostatnie 4 znaki
+        if len(sid_hex) > 4:
+            sid_hex = sid_hex[-4:]
+
+        # Nazwa multipleksu (ensemble) jako grupa kanałów
+        ensembles = entry.get("Ensembles", [])
+        group = ensembles[0].get("Label", "DAB+") if ensembles else "DAB+"
+
+        stations[sid_hex] = {"name": label, "group": group}
+
+    print(f"  ✓ ServiceList.json: {len(stations)} stacji z '{path}'")
+    return stations
+
 def fetch_mux_json(stream_base: str) -> dict:
     """
     Pobiera /mux.json z welle-cli — WSZYSTKIE stacje z prawdziwymi nazwami, na żywo.
@@ -253,26 +316,78 @@ def fetch_mux_json(stream_base: str) -> dict:
         return {}
 
 
-def discover_stations(programmes_by_sid: dict, spi_dir: Path, mux_stations: dict) -> dict:
+def find_logo_in_spi(name: str, logos_dir: Path) -> str:
+    """
+    Fuzzy match nazwy stacji do pliku PNG w katalogu logos.
+    Zwraca file:// URI lub pusty string.
+    """
+    import unicodedata
+    if not logos_dir or not logos_dir.exists():
+        return ""
+
+    def norm(s):
+        s = unicodedata.normalize("NFKD", s.lower())
+        return re.sub(r"[^a-z0-9]", "", s)
+
+    name_n = norm(name)
+    best, best_score = None, 0
+    for png in logos_dir.glob("*.png"):
+        stem = norm(png.stem)
+        if not stem:
+            continue
+        if stem in name_n or name_n[:len(stem)] == stem:
+            score = len(stem)
+        else:
+            score = sum(a == b for a, b in zip(stem, name_n))
+            if score < 2:
+                score = 0
+        if score > best_score:
+            best_score, best = score, png
+    return best.as_uri() if best and best_score >= 2 else ""
+
+
+def discover_stations(programmes_by_sid: dict, spi_dir: Path,
+                      mux_stations: dict, service_list: dict,
+                      stream_base: str = "", out_dir: Path = None) -> dict:
     """
     Buduje słownik stacji {sid_hex: {name, group, logo}}.
 
-    Priorytet źródeł (od najlepszego):
-      1. /mux.json (welle-cli) — WSZYSTKIE stacje z prawdziwymi nazwami, na żywo
-      2. KNOWN_STATIONS        — ręczna lista jako uzupełnienie/fallback
-      3. EPG (programmes_by_sid) — stacje które mają EPG ale brak ich gdzie indziej
-      4. Fallback: "DAB {SID}"
+    Priorytet źródeł nazw:
+      1. ServiceList.json (AbracaDABra) — wszystkie odebrane stacje, świeże nazwy
+      2. /mux.json (welle-cli)          — stacje aktualnie w powietrzu
+      3. EPG PI.xml / EHB.xml           — stacje nadające EPG
+      4. KNOWN_STATIONS                 — ostateczny fallback
+      5. "DAB {SID}"
 
-    Stacje bez EPG są uwzględniane — pojawią się w M3U bez ramówki.
+    Priorytet źródeł logo:
+      1. {stream_base}/slide/0xSID        — obraz SLS z welle-cli (logo stacji na żywo)
+      2. PNG z SPI skopiowane do out_dir/logos/ (fuzzy match do nazwy)
+      3. brak logo
     """
+    # Skopiuj PNG z SPI do out_dir/logos/ (Kodi wymaga file:// lub http://)
+    logos_dir = None
+    if spi_dir and spi_dir.exists() and out_dir:
+        logos_dir = out_dir / "logos"
+        logos_dir.mkdir(exist_ok=True)
+        import shutil
+        for png in spi_dir.rglob("*.png"):
+            dest = logos_dir / png.name
+            if not dest.exists():
+                shutil.copy2(png, dest)
+
     stations = {}
     all_sids = set()
+    all_sids.update(service_list.keys())
     all_sids.update(mux_stations.keys())
     all_sids.update(KNOWN_STATIONS.keys())
     all_sids.update(programmes_by_sid.keys())
 
     for sid in all_sids:
-        if sid in mux_stations:
+        # Nazwa stacji
+        if sid in service_list:
+            name  = service_list[sid]["name"]
+            group = service_list[sid].get("group", "DAB+")
+        elif sid in mux_stations:
             name  = mux_stations[sid]["name"]
             group = mux_stations[sid].get("ensemble", "DAB+")
         elif sid in KNOWN_STATIONS:
@@ -282,18 +397,18 @@ def discover_stations(programmes_by_sid: dict, spi_dir: Path, mux_stations: dict
             name  = f"DAB {sid.upper()}"
             group = "DAB+"
 
-        logo = ""
-        if spi_dir and spi_dir.exists():
-            logo_name = KNOWN_STATIONS.get(sid, {}).get("logo", "")
-            if logo_name:
-                candidates = list(spi_dir.rglob(logo_name))
-                if candidates:
-                    logo = candidates[0].as_uri()
+        # Logo stacji
+        if stream_base:
+            # welle-cli: /slide/0xSID serwuje aktualny obraz SLS (logo nadawane przez DAB)
+            logo = f"{stream_base.rstrip('/')}/slide/0x{sid}"
+        elif logos_dir:
+            logo = find_logo_in_spi(name, logos_dir)
+        else:
+            logo = ""
 
         stations[sid] = {"name": name, "group": group, "logo": logo}
 
     return stations
-
 
 def generate_m3u(stations: dict, programmes_by_sid: dict, stream_base: str, out_file: Path, epg_xml_path: Path):
     """Generuje plik M3U dla pvr.iptvsimple."""
@@ -498,6 +613,14 @@ def main():
         help="Katalog wyjściowy (domyślnie: ~/kodi_dab/)",
     )
     parser.add_argument(
+        "--service-list",
+        default="",
+        help=(
+            "Ścieżka do ServiceList.json AbracaDABra\n"
+            f"  Domyślnie szukana w: ~/.config/AbracaDABra/ServiceList.json"
+        ),
+    )
+    parser.add_argument(
         "--stream-base",
         default="",
         help=(
@@ -516,10 +639,13 @@ def main():
 
     print("\n=== AbracaDABra → Kodi converter ===\n")
 
-    # 1. Pobierz listę stacji z welle-cli /mux.json (najlepsza metoda)
+    # 1. Czytaj ServiceList.json z AbracaDABra (najbardziej kompletne źródło)
+    service_list = read_service_list(args.service_list)
+
+    # 2. Pobierz listę stacji z welle-cli /mux.json (aktualne stacje na żywo)
     mux_stations = fetch_mux_json(args.stream_base)
 
-    # 2. Wczytaj EPG z plików AbracaDABra
+    # 3. Wczytaj EPG z plików AbracaDABra
     if args.abra_zip:
         programmes_by_sid = load_from_zips(args.abra_zip, args.apps_zip)
     else:
@@ -528,7 +654,7 @@ def main():
         programmes_by_sid = load_all_programmes(epg_dir)
 
 
-    if not programmes_by_sid and not mux_stations:
+    if not programmes_by_sid and not mux_stations and not service_list:
         print("\n  [BŁĄD] Brak danych EPG i brak odpowiedzi z /mux.json.", file=sys.stderr)
         print("  Uruchom welle-cli z --stream-base lub sprawdź ścieżki EPG.", file=sys.stderr)
         sys.exit(1)
@@ -536,9 +662,10 @@ def main():
     if not programmes_by_sid:
         print("  [INFO] Brak plików EPG — lista stacji pochodzi wyłącznie z /mux.json")
 
-    # 3. Połącz źródła stacji
+    # 4. Połącz źródła stacji
     spi_dir = Path(args.spi_dir)
-    stations = discover_stations(programmes_by_sid, spi_dir, mux_stations)
+    stations = discover_stations(programmes_by_sid, spi_dir, mux_stations, service_list,
+                                  args.stream_base, out_dir)
 
     print_summary(stations, programmes_by_sid)
 
