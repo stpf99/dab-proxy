@@ -1,0 +1,18 @@
+[Unit]
+Description=dab2kodi HTTP server — serwuje M3U + EPG XML
+After=network.target dab2kodi.service
+Wants=dab2kodi.timer
+
+[Service]
+Type=simple
+WorkingDirectory=%h/dab2kodi
+ExecStart=/usr/bin/python3 %h/dab2kodi/dab2kodi-server.py \
+    --port 8765 \
+    --serve-dir %h/Muzyka/
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Cykliczne odświeżanie M3U + EPG XML (co godzinę)
+After=welle.service
+
+[Timer]
+# Pierwsze uruchomienie: 15 sekund po starcie timera
+OnBootSec=15sec
+# Następnie co godzinę
+OnUnitActiveSec=1h
+# Jeśli jednostka była wyłączona i timer "przegapił" uruchomienie — nadgań
+Persistent=true
+Unit=dab2kodi.service
+
+[Install]
+WantedBy=timers.target

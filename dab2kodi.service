@@ -1,0 +1,20 @@
+[Unit]
+Description=abradab2kodi — generuje M3U + EPG XML dla Kodi
+After=welle.service
+Requires=welle.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dab2kodi
+# Czekaj aż welle-cli wystawi /mux.json (kilka sekund na init radia)
+ExecStartPre=/bin/sleep 8
+ExecStart=/usr/bin/python3 %h/dab2kodi/abradab2kodi.py \
+    --stream-base http://localhost:7272 \
+    --out-dir %h/Muzyka/
+StandardOutput=journal
+StandardError=journal
+# Zostaw plik znacznika daty dla timera
+RemainAfterExit=no
+
+[Install]
+WantedBy=default.target
